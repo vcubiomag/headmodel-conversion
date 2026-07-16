@@ -1,0 +1,6 @@
+[submodule "external/cgal"]
+	path = external/cgal
+	url = https://github.com/CGAL/cgal
+[submodule "external/opencascade"]
+	path = external/opencascade
+	url = https://github.com/Open-Cascade-SAS/OCCT

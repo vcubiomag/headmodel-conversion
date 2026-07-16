@@ -1,0 +1,45 @@
+[project]
+name = "headmodel-conversion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cyclopts>=3.0",
+    "numpy>=1.26",
+    "pyvista[io]>=0.48.4",
+]
+
+[project.scripts]
+headmodel-convert = "headmodel_conversion.cli:app"
+
+[build-system]
+requires = [
+    "scikit-build-core>=0.12",
+    "nanobind>=2.13.0",
+]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+wheel.exclude = ["**.cpp", "**.hpp"]
+# Only install our extension component. EXCLUDE_FROM_ALL already suppresses OCCT's install rules;
+# this ensures nothing from OCCT (headers, static libs, resources) can land in the wheel.
+install.components = ["headmodel_ext"]
+
+[dependency-groups]
+build = [
+    "scikit-build-core>=0.12",
+    "nanobind>=2.13.0",
+]
+
+[tool.uv]
+default-groups = ["build"]
+no-build-isolation-package = ["headmodel-conversion"]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,hpp,cpp}" }, { file = "CMakeLists.txt" }]
+
+[tool.ruff]
+line-length = 96
+target-version = "py311"
+exclude = ["external"]
