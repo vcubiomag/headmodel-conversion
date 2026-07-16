@@ -45,6 +45,9 @@ def _read_charm_mesh(msh_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
 
 def _read_roi_points(m2m_dir: Path, config: SizingConfig) -> np.ndarray | None:
     """Coordinates of the coil-site electrodes, in mesh subject space."""
+    if not config.roi.electrodes:
+        return None
+
     csv_path = m2m_dir / "eeg_positions" / config.roi.csv_name
     if not csv_path.exists():
         print(f"  ! ROI CSV not found ({csv_path.name}); skipping ROI refinement")

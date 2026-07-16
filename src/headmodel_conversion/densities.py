@@ -3,11 +3,12 @@
 CHARM's native surface is already ~1.0-1.4 mm, and edge-collapse can only
 *coarsen*, so the targets here are deliberately **coarser** than CHARM to cut the
 BREP face count for Ansys. Smooth, low-field tissues (scalp, skull, deep white
-matter) are coarsened hard; the cortex (GM/CSF) is coarsened only moderately; and
-within `roi.radius_mm` of the coil sites everything is held near CHARM resolution
-(`roi.edge_mm`) so accuracy is preserved where the E-field is evaluated. Maxwell
-does its own adaptive volumetric FEM refinement, so these surfaces only need
-geometric fidelity, not solver resolution.
+matter) are coarsened hard; the cortex (GM/CSF) is coarsened only moderately. If
+ROI electrodes are configured, within `roi.radius_mm` of those coil sites
+everything is held near CHARM resolution (`roi.edge_mm`) so accuracy is
+preserved where the E-field is evaluated -- otherwise no ROI refinement is
+applied. Maxwell does its own adaptive volumetric FEM refinement, so these
+surfaces only need geometric fidelity, not solver resolution.
 
 An edge length L (mm) corresponds to a node density rho = 2 / (sqrt(3) * L^2)
 (nodes/mm^2); `rho_to_edge` converts the other way if you prefer to think in
@@ -43,15 +44,16 @@ def rho_to_edge(rho: float) -> float:
 
 @dataclass
 class ROIConfig:
-    """Keep near-CHARM resolution around the TMS coil target sites.
+    """Keep near-CHARM resolution around chosen TMS coil target sites.
 
     `electrodes` are 10-10 labels read from the subject's eeg_positions CSV
-    (mesh subject space): M1=C3, DLPFC=F3, SMA=FCz, PPC=P3 & P4. Within
+    (mesh subject space), e.g. M1=C3, DLPFC=F3, SMA=FCz, PPC=P3/P4. Within
     `radius_mm` of any site the target edge length ramps from `edge_mm` (fine, at
-    the site) up to the tissue's base edge length (at the radius).
+    the site) up to the tissue's base edge length (at the radius). Empty by
+    default -- ROI refinement is opt-in per subject/study.
     """
 
-    electrodes: tuple[str, ...] = ("C3", "F3", "FCz", "P3", "P4")
+    electrodes: tuple[str, ...] = ()
     radius_mm: float = 25.0
     edge_mm: float = 1.0
     csv_name: str = "EEG10-10_UI_Jurak_2007.csv"
