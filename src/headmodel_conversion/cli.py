@@ -9,7 +9,7 @@ import cyclopts
 from . import SizingConfig, convert
 from .densities import ROIConfig
 
-app = cyclopts.App(help="Convert a CHARM m2m directory into Ansys-importable STEP bodies.")
+app = cyclopts.App(help="Convert a CHARM m2m directory into Ansys-importable STEP files.")
 
 
 @app.default
@@ -21,7 +21,7 @@ def main(
     roi_radius_mm: float = ROIConfig.radius_mm,
     roi_edge_mm: float = ROIConfig.edge_mm,
 ) -> None:
-    """Decimate one subject and export per-tissue STEP solids.
+    """Decimate one subject and export one STEP file per tissue.
 
     Parameters
     ----------
@@ -43,7 +43,7 @@ def main(
         roi=ROIConfig(electrodes=tuple(roi or ()), radius_mm=roi_radius_mm, edge_mm=roi_edge_mm)
     )
     written = convert(m2m_dir, out_dir, config)
-    print(f"wrote {len(written)} STEP bodies to {out_dir}")
+    print(f"wrote {len(written)} tissue STEP files to {out_dir}")
 
 
 if __name__ == "__main__":

@@ -94,8 +94,10 @@ def group_shells(shells: list[pyvista.PolyData]) -> list[list[pyvista.PolyData]]
 def solid_names(label: str, groups: list[list[pyvista.PolyData]]) -> list[str]:
     """Name per solid: single -> `<label>`, multiple -> `<label>_N`.
 
-    Eyeballs get anatomical L/R suffixes by centroid x-coordinate (RAS: +x is
-    the subject's right). `groups[i][0]` is solid i's outer (peripheral) shell.
+    These name the products inside the tissue's STEP file, which is what tells
+    its parts apart once they share one file. Eyeballs get anatomical L/R
+    suffixes by centroid x-coordinate (RAS: +x is the subject's right).
+    `groups[i][0]` is solid i's outer (peripheral) shell.
     """
     if len(groups) == 1:
         return [label]

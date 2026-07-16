@@ -3,7 +3,8 @@
 `convert()` is the whole pipeline for one subject: read the CHARM `.msh`, build
 the multi-material interface complex, QEM-decimate each tissue-pair patch to its
 TMS-tuned target density (keeping shared feature curves fixed so the result stays
-conformal), then export one B-rep STEP solid per tissue via OpenCASCADE.
+conformal), then export one STEP file per tissue via OpenCASCADE, holding every
+B-rep solid of that tissue as its own named product.
 """
 
 from __future__ import annotations
@@ -25,12 +26,15 @@ __all__ = ["convert", "SizingConfig"]
 VTK_TETRA = 10
 
 
-def _write_step_job(job: tuple[str, list[tuple[np.ndarray, np.ndarray]]]) -> str:
+Part = tuple[str, list[tuple[np.ndarray, np.ndarray]]]
+
+
+def _write_step_job(job: tuple[str, list[Part]]) -> str:
     # Runs in a worker process: OCCT's STEP transfer serializes on in-process
     # global singletons, so separate processes -- not threads -- are what let
-    # independent tissue bodies export in parallel.
-    path, arrs = job
-    write_step(arrs, path)
+    # independent tissue files export in parallel.
+    path, parts = job
+    write_step(parts, path)
     return path
 
 
@@ -72,9 +76,11 @@ def convert(
     out_dir: str | Path,
     config: SizingConfig | None = None,
 ) -> list[Path]:
-    """Convert one CHARM `m2m` directory into per-tissue STEP bodies.
+    """Convert one CHARM `m2m` directory into one STEP file per tissue.
 
-    Returns the list of written `.step` paths.
+    Each file holds every solid of that tissue as a separately named product
+    (e.g. `eye_balls.step` holds `eye_ball_L` and `eye_ball_R`). Returns the
+    written `.step` paths, sorted.
 
     The STEP export runs in a process pool, so callers must be import-safe
     (guard the entry point with ``if __name__ == "__main__":``) on `spawn`
@@ -101,15 +107,24 @@ def convert(
     d_points, d_tris, d_refs = decimate_interfaces(points, tets, labels, sizes)
     print(f"  decimated complex: {len(d_points):,} nodes, {len(d_tris):,} triangles")
 
-    jobs: list[tuple[str, list[tuple[np.ndarray, np.ndarray]]]] = []
+    jobs: list[tuple[int, str, list[Part]]] = []
     for tag, label in VOLUME_KEY_TO_LABEL.items():
-        for name, shells in tissue_solids(d_points, d_tris, d_refs, tag, label):
-            arrs = [shell_arrays(s) for s in shells]
-            jobs.append((str(out_dir / f"{name}.step"), arrs))
-            print(f"  {name}: {len(arrs)} shell(s), {sum(len(a[1]) for a in arrs)} faces")
+        solids = tissue_solids(d_points, d_tris, d_refs, tag, label)
+        if not solids:
+            continue
+        parts = [(name, [shell_arrays(s) for s in shells]) for name, shells in solids]
+        n_faces = sum(len(tris) for _, arrs in parts for _, tris in arrs)
+        print(f"  {label}: {len(parts)} part(s), {n_faces} faces")
+        jobs.append((n_faces, str(out_dir / f"{label}.step"), parts))
 
-    workers = max(1, min(len(jobs), os.cpu_count() or 1, 8))
+    # Largest first: there are only ever a handful of tissues, and one of them
+    # (gray matter) dwarfs the rest, so it sets the makespan -- start it before
+    # the small ones can queue ahead of it.
+    jobs.sort(key=lambda job: job[0], reverse=True)
+    payloads = [(path, parts) for _, path, parts in jobs]
+
+    workers = max(1, min(len(payloads), os.cpu_count() or 1, 8))
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        written = [Path(p) for p in pool.map(_write_step_job, jobs)]
+        written = [Path(p) for p in pool.map(_write_step_job, payloads)]
 
-    return written
+    return sorted(written)

@@ -7,8 +7,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -45,7 +45,11 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <STEPControl_Writer.hxx>
 #include <STEPControl_StepModelType.hxx>
-#include <Interface_Static.hxx>
+#include <DESTEP_Parameters.hxx>
+#include <StepBasic_Product.hxx>
+#include <StepData_StepModel.hxx>
+#include <TCollection_HAsciiString.hxx>
+#include <UnitsMethods_LengthUnit.hxx>
 #include <Standard_Failure.hxx>
 
 namespace nb = nanobind;
@@ -288,53 +292,120 @@ static TopoDS_Shell build_shell(const double* pts, std::size_t np,
   return shell;
 }
 
-// shells: list of (points (N,3) float64, triangles (M,3) int32); [0] = outer
-// peripheral shell, [1:] = nested void shells (cavities).
-void write_step(nb::list shells, const std::string& out_path) {
-  if (nb::len(shells) == 0)
-    throw std::runtime_error("write_step: no shells");
+// Borrowed view of one shell's arrays. The nb::list argument keeps the numpy
+// objects alive for the whole call, so these stay valid after the GIL is
+// released (unlike the nb::ndarray handles, whose refcounting needs the GIL).
+struct ShellView {
+  const double* pts;
+  std::size_t np;
+  const int32_t* tris;
+  std::size_t nt;
+};
 
-  // The unit is a process-global; set it exactly once so concurrent writers
-  // never race on it (see the GIL release below).
-  static std::once_flag unit_once;
-  std::call_once(unit_once,
-                 [] { Interface_Static::SetCVal("write.step.unit", "MM"); });
+struct SolidView {
+  std::string name;
+  std::vector<ShellView> shells;  // [0] = outer, [1:] = cavities
+};
+
+// solids: list of (name, shells), where shells is a list of
+// (points (N,3) float64, triangles (M,3) int32); shells[0] is the outer
+// peripheral shell and shells[1:] are its nested void shells (cavities).
+// Every solid becomes its own STEP product named `name` in the one output file.
+void write_step(nb::list solids, const std::string& out_path) {
+  if (nb::len(solids) == 0)
+    throw std::runtime_error("write_step: no solids");
+
+  std::vector<SolidView> views;
+  views.reserve(nb::len(solids));
+  for (std::size_t i = 0; i < nb::len(solids); ++i) {
+    nb::tuple entry = nb::cast<nb::tuple>(solids[i]);
+    SolidView view;
+    view.name = nb::cast<std::string>(entry[0]);
+    nb::list shells = nb::cast<nb::list>(entry[1]);
+    if (nb::len(shells) == 0)
+      throw std::runtime_error("write_step: no shells for solid " + view.name);
+    view.shells.reserve(nb::len(shells));
+    for (std::size_t s = 0; s < nb::len(shells); ++s) {
+      nb::tuple item = nb::cast<nb::tuple>(shells[s]);
+      auto pts = nb::cast<np_in<double>>(item[0]);
+      auto tris = nb::cast<np_in<int32_t>>(item[1]);
+      view.shells.push_back(
+          {pts.data(), pts.shape(0), tris.data(), tris.shape(0)});
+    }
+    views.push_back(std::move(view));
+  }
 
   // Any OCCT operation below can raise a Standard_Failure. In 8.0 that derives from
   // std::exception, so nanobind would translate it on its own, but we rethrow with the
   // output path and OCCT's own message to make the Python-side error actionable.
   try {
-    BRep_Builder sbuilder;
-    TopoDS_Solid solid;
-    sbuilder.MakeSolid(solid);
-
-    std::size_t skipped = 0;
-    for (std::size_t s = 0; s < nb::len(shells); ++s) {
-      nb::tuple item = nb::cast<nb::tuple>(shells[s]);
-      auto pts = nb::cast<np_in<double>>(item[0]);
-      auto tris = nb::cast<np_in<int32_t>>(item[1]);
-      TopoDS_Shell shell = build_shell(pts.data(), pts.shape(0),
-                                       tris.data(), tris.shape(0), skipped);
-      if (s == 0)
-        sbuilder.Add(solid, shell);
-      else
-        sbuilder.Add(solid, TopoDS::Shell(shell.Reversed()));
-    }
-
-    // STEP transfer + serialization is the dominant cost and touches no Python
-    // state, so drop the GIL: the caller writes independent tissue bodies on a
-    // thread pool. Each call owns its own writer/solid; the only shared OCCT
-    // global (the unit) is fixed once above before any release.
-    bool transfer_ok = false, write_ok = false;
+    bool transfer_ok = true, write_ok = false;
+    std::string failed;
+    // None of the OCCT work touches Python state, so drop the GIL for all of it:
+    // the caller writes independent tissue files from a process pool (OCCT's
+    // transfer serializes on in-process globals, so threads would not help), and
+    // each call owns its own writer, params and shapes.
     {
       nb::gil_scoped_release nogil;
+
+      // Constructed first: its ctor runs the idempotent STEPControl_Controller::Init()
+      // that registers the statics InitFromStatic reads back. The 5-arg Transfer
+      // overload below then takes these params explicitly; the 3-arg one would
+      // re-init the model from the process-global statics on every call.
       STEPControl_Writer writer;
-      transfer_ok = writer.Transfer(solid, STEPControl_AsIs) == IFSelect_RetDone;
+      DESTEP_Parameters params;
+      params.InitFromStatic();
+      params.WriteUnit = UnitsMethods_LengthUnit_Millimeter;
+
+      Handle(StepData_StepModel) model = writer.Model();
+      std::size_t skipped = 0;
+      for (const SolidView& view : views) {
+        BRep_Builder sbuilder;
+        TopoDS_Solid solid;
+        sbuilder.MakeSolid(solid);
+        for (std::size_t s = 0; s < view.shells.size(); ++s) {
+          const ShellView& sv = view.shells[s];
+          TopoDS_Shell shell = build_shell(sv.pts, sv.np, sv.tris, sv.nt, skipped);
+          if (s == 0)
+            sbuilder.Add(solid, shell);
+          else
+            sbuilder.Add(solid, TopoDS::Shell(shell.Reversed()));
+        }
+
+        // Transferring onto the same writer appends another root product, so all
+        // of this tissue's solids end up in the one file.
+        const int before = model->NbEntities();
+        if (writer.Transfer(solid, STEPControl_AsIs, params) != IFSelect_RetDone) {
+          transfer_ok = false;
+          failed = view.name;
+          break;
+        }
+
+        // Name the product this transfer appended. Not via params.WriteProductName:
+        // that route appends the actor's assembly index to the name, and the actor
+        // is a process-global we cannot reset, so the suffix would depend on what
+        // else this worker had already written. MakeSDR creates the one product
+        // (using the same string for its id and name) before transferring any
+        // geometry, so it is at the front of the range -- stop on it rather than
+        // walk the millions of geometry entities behind it.
+        Handle(TCollection_HAsciiString) pname =
+            new TCollection_HAsciiString(view.name.c_str());
+        for (int e = before + 1, n = model->NbEntities(); e <= n; ++e) {
+          Handle(StepBasic_Product) product =
+              Handle(StepBasic_Product)::DownCast(model->Value(e));
+          if (!product.IsNull()) {
+            product->SetId(pname);
+            product->SetName(pname);
+            break;
+          }
+        }
+      }
       if (transfer_ok)
         write_ok = writer.Write(out_path.c_str()) == IFSelect_RetDone;
     }
     if (!transfer_ok)
-      throw std::runtime_error("write_step: STEP transfer failed for " + out_path);
+      throw std::runtime_error("write_step: STEP transfer failed for solid " +
+                               failed + " in " + out_path);
     if (!write_ok)
       throw std::runtime_error("write_step: STEP write failed for " + out_path);
   } catch (const Standard_Failure& e) {
@@ -348,6 +419,7 @@ NB_MODULE(_mesher_ext, m) {
         nb::arg("targets"),
         "Decimate one interface patch under a per-vertex target edge-length "
         "field, keeping its feature boundary fixed.");
-  m.def("write_step", &write_step, nb::arg("shells"), nb::arg("out_path"),
-        "Export one B-rep solid (outer + void shells) to AP214 STEP.");
+  m.def("write_step", &write_step, nb::arg("solids"), nb::arg("out_path"),
+        "Export named B-rep solids (each outer + void shells) to one AP214 "
+        "STEP file, one named product per solid.");
 }
