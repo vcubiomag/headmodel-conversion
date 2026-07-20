@@ -1,28 +1,41 @@
-"""Python side of the surface decimator: build the interface complex, decimate
-each material-pair patch, and stitch the results back into one shared-vertex
-complex."""
+"""Python side of the C++ mesher: the `_mesher_ext` entry points, plus the
+interface-complex extraction that feeds them."""
 
 from __future__ import annotations
 
-import os
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 
-from . import _mesher_ext
+from ._mesher_ext import heal_soup, mmg_remesh, repair_solids, write_step
 
-write_step = _mesher_ext.write_step
+__all__ = ["boundary_facets", "write_step", "mmg_remesh", "repair_solids", "heal_soup"]
 
 
-def _boundary_facets(tets: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def boundary_facets(
+    points: np.ndarray, tets: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Interface triangles with a per-pair reference `ref = lo*1000 + hi`.
 
     A facet is on a tissue boundary when it bounds the meshed region (used by one
-    tet) or separates two different labels; `lo`/`hi` are the sorted tissue labels
-    on its two sides (outside = 0).
+    tet) or separates two different labels; `lo`/`hi` are the tissue labels on its
+    two sides, with `hi = 0` for the outside.
+
+    Each triangle is wound so its normal points out of `lo` and into `hi`. The tet
+    it was cut from is the only thing that knows which way that is, so the winding
+    has to be taken here and carried through -- orientation is not a property of
+    the patch the facet later lands in. A tissue's own boundary is then just its
+    facets, reversed wherever the tissue sits on the `hi` side.
     """
+    # A tet's faces only have well-defined outward windings once the tet itself is
+    # positively oriented, so fix the sign before reading any winding off it.
+    edge = points[tets[:, 1:]] - points[tets[:, [0]]]
+    vol6 = np.einsum("ij,ij->i", edge[:, 0], np.cross(edge[:, 1], edge[:, 2]))
+    tets = tets.copy()
+    neg = vol6 < 0.0
+    tets[neg, 0], tets[neg, 1] = tets[neg, 1], tets[neg, 0]
+
+    # The outward-facing windings of a positively-oriented tet.
     faces = np.concatenate(
-        [tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]]
+        [tets[:, [0, 2, 1]], tets[:, [0, 1, 3]], tets[:, [0, 3, 2]], tets[:, [1, 2, 3]]]
     )
     face_label = np.tile(labels, 4)
 
@@ -47,69 +60,14 @@ def _boundary_facets(tets: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, 
 
     interior = (counts == 2) & (lab_min == lab_max)
     boundary = ~interior & (counts <= 2)  # drop any non-manifold (count > 2) facets
-    bkeys = uniq_keys[boundary]
-    mask21 = np.uint64((1 << 21) - 1)
-    tris = np.stack(
-        [
-            (bkeys >> np.uint64(42)).astype(np.int64),
-            ((bkeys >> np.uint64(21)) & mask21).astype(np.int64),
-            (bkeys & mask21).astype(np.int64),
-        ],
-        axis=1,
-    )
+
+    # Of the (up to two) tets sharing a facet, keep the winding contributed by the
+    # `lo`-labelled one: its outward normal points out of lo and into hi. A surface
+    # facet has only the one tet and `hi = 0`, so the same rule covers it unchanged.
+    lo_side = face_label == lab_min[inv]
+    src = np.empty(len(uniq_keys), dtype=np.int64)
+    src[inv[lo_side]] = np.flatnonzero(lo_side)
+    tris = faces[src[boundary]]
+
     refs = lab_min[boundary] * 1000 + np.where(counts[boundary] == 1, 0, lab_max[boundary])
     return tris.astype(np.int32), refs.astype(np.int32)
-
-
-def decimate_interfaces(
-    points: np.ndarray,
-    tets: np.ndarray,
-    labels: np.ndarray,
-    sizes: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Decimate every interface patch and stitch into one shared-vertex complex.
-
-    `sizes` is the per-vertex target edge length. Each patch is QEM-decimated
-    under that field with its feature-boundary curves held fixed, so patches
-    still meet exactly and the reassembled per-tissue surfaces stay conformal.
-    Returns (points, triangles, refs).
-    """
-    points = np.ascontiguousarray(points, dtype=np.float64)
-    sizes = np.ascontiguousarray(sizes, dtype=np.float64)
-    tris, refs = _boundary_facets(tets, labels)
-
-    def _decimate_one(ref: int) -> tuple[np.ndarray, np.ndarray]:
-        patch_tris = tris[refs == ref]
-        used = np.unique(patch_tris)
-        remap = np.full(len(points), -1, dtype=np.int64)
-        remap[used] = np.arange(len(used))
-        local_pts = np.ascontiguousarray(points[used])
-        local_faces = remap[patch_tris].astype(np.int32)
-        local_targets = np.ascontiguousarray(sizes[used])
-        # decimate_patch drops the GIL for its CGAL work, so patches run in
-        # parallel across the pool.
-        return _mesher_ext.decimate_patch(local_pts, local_faces, local_targets)
-
-    uniq_refs = np.unique(refs)
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-        results = list(pool.map(_decimate_one, uniq_refs))
-
-    out_points: list[np.ndarray] = []
-    out_faces: list[np.ndarray] = []
-    out_refs: list[np.ndarray] = []
-    offset = 0
-    for ref, (dp, df) in zip(uniq_refs, results):
-        out_points.append(dp)
-        out_faces.append(df.astype(np.int64) + offset)
-        out_refs.append(np.full(len(df), ref, dtype=np.int32))
-        offset += len(dp)
-
-    P = np.vstack(out_points)
-    F = np.vstack(out_faces)
-    R = np.concatenate(out_refs)
-
-    # Feature-curve vertices are preserved exactly, so they coincide across
-    # patches -- merge them (and any coincident interior vertices) globally.
-    uP, inv = np.unique(P, axis=0, return_inverse=True)
-    F = inv.ravel()[F.ravel()].reshape(-1, 3).astype(np.int32)
-    return uP, F, R

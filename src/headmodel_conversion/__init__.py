@@ -1,25 +1,36 @@
-"""CHARM head model -> decimated, Ansys-importable STEP bodies.
+"""CHARM head model -> coarsened, Ansys-importable STEP bodies.
 
-`convert()` is the whole pipeline for one subject: read the CHARM `.msh`, build
-the multi-material interface complex, QEM-decimate each tissue-pair patch to its
-TMS-tuned target density (keeping shared feature curves fixed so the result stays
-conformal), then export one STEP file per tissue via OpenCASCADE, holding every
-B-rep solid of that tissue as its own named product.
+`convert()` is the whole pipeline for one subject: read the CHARM `.msh`, remesh
+the tet volume with MMG3D, cut the multi-material interface complex off the
+result, resolve each tissue's self-contacts, decompose it into solids, and export
+one STEP file per tissue via OpenCASCADE, holding every B-rep solid of that
+tissue as its own named product.
+
+Remeshing the *volume* is the load-bearing choice. A tissue's two walls are
+remeshed together and never crossed, so the complex stays conformal and
+non-self-intersecting by construction and every tissue resolves into a valid
+solid -- which coarsening the surfaces alone could not achieve for the folded
+tissues (gray matter, CSF, cortical bone), whose walls come within a millimetre
+of each other through the sulci.
+
+Each stage checks its own invariant and raises rather than handing the next stage
+something it cannot use -- a tissue that cannot be exported validly is a failure
+to look at, not a file to write.
 """
 
 from __future__ import annotations
 
-import csv
 import os
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pyvista
 
-from .densities import SizingConfig, vertex_target_sizes
-from .mesher import decimate_interfaces, write_step
-from .surfaces import VOLUME_KEY_TO_LABEL, shell_arrays, tissue_solids
+from .mesher import boundary_facets, mmg_remesh, write_step
+from .surfaces import VOLUME_KEY_TO_LABEL, tissue_solids
 
 __all__ = ["convert", "SizingConfig"]
 
@@ -29,10 +40,45 @@ VTK_TETRA = 10
 Part = tuple[str, list[tuple[np.ndarray, np.ndarray]]]
 
 
+@dataclass
+class SizingConfig:
+    """How to coarsen the CHARM mesh before export. `method` picks the pipeline:
+
+    - ``"mmg"`` (default): remesh the whole tet volume with MMG3D under
+      `mmg_hausd_mm`. Conformal and non-self-intersecting by construction, so
+      every tissue -- including the folded ones -- exports as a valid solid.
+      `mmg_hausd_mm` is the headline quality/size knob (bigger coarsens more by
+      smoothing sulci); the others cap edge length and size gradation.
+    - ``"charm"``: CHARM's own triangulation, no coarsening. Every tissue valid,
+      but ~1.24M faces / ~2.7 GB per subject -- too large for Ansys.
+    """
+
+    method: Literal["mmg", "charm"] = "mmg"
+
+    # Tuned on sub-001 (anisotropic): ~320k boundary faces, ~3.7x fewer than CHARM,
+    # at ~0.3 mm typical / ~2 mm max deviation. Past hausd ~2 the face count plateaus
+    # (curvature/topology floor) while fidelity only degrades, so ~1.5-2.0 is the
+    # sound floor; hgrad 2.0 coarsens faster than MMG's 1.3 default at equal fidelity.
+    mmg_hausd_mm: float = 1.5
+    mmg_hmax_mm: float = 15.0
+    mmg_hmin_mm: float = 0.2
+    mmg_hgrad: float = 2.0
+    # Anisotropic size map: long thin triangles along a sulcus's low-curvature axis,
+    # roughly halving the face count vs isotropic at equal fidelity. Angle detection
+    # must stay on -- MMG3D skips boundary remeshing entirely without it. FE-quality
+    # passes are skipped (`nofem`): Ansys remeshes, so it only needs valid boundaries.
+    mmg_aniso: bool = True
+    mmg_angle_detect: bool = True
+    mmg_nofem: bool = True
+
+
 def _write_step_job(job: tuple[str, list[Part]]) -> str:
-    # Runs in a worker process: OCCT's STEP transfer serializes on in-process
-    # global singletons, so separate processes -- not threads -- are what let
-    # independent tissue files export in parallel.
+    """Export one tissue's STEP file. Runs in a worker process.
+
+    OCCT's STEP transfer serializes on in-process global singletons, so separate
+    processes -- not threads -- are what let independent tissue files export in
+    parallel.
+    """
     path, parts = job
     write_step(parts, path)
     return path
@@ -45,30 +91,6 @@ def _read_charm_mesh(msh_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
     labels = np.asarray(mesh.cell_data["gmsh:physical"])[tet_mask].astype(np.int32)
     tets = np.asarray(mesh.cells_dict[VTK_TETRA], dtype=np.int64)
     return np.ascontiguousarray(mesh.points, dtype=np.float64), tets, labels
-
-
-def _read_roi_points(m2m_dir: Path, config: SizingConfig) -> np.ndarray | None:
-    """Coordinates of the coil-site electrodes, in mesh subject space."""
-    if not config.roi.electrodes:
-        return None
-
-    csv_path = m2m_dir / "eeg_positions" / config.roi.csv_name
-    if not csv_path.exists():
-        print(f"  ! ROI CSV not found ({csv_path.name}); skipping ROI refinement")
-        return None
-
-    wanted = set(config.roi.electrodes)
-    found: dict[str, list[float]] = {}
-    with open(csv_path, newline="") as f:
-        for row in csv.reader(f):
-            # rows are: Electrode,x,y,z,Name
-            if len(row) >= 5 and row[4] in wanted:
-                found[row[4]] = [float(row[1]), float(row[2]), float(row[3])]
-
-    missing = wanted - found.keys()
-    if missing:
-        print(f"  ! ROI electrodes missing from {csv_path.name}: {sorted(missing)}")
-    return np.array(list(found.values()), dtype=np.float64) if found else None
 
 
 def convert(
@@ -100,22 +122,50 @@ def convert(
     points, tets, labels = _read_charm_mesh(msh_path)
     print(f"  input: {len(points):,} nodes, {len(tets):,} tets")
 
-    roi_points = _read_roi_points(m2m_dir, config)
-    sizes = vertex_target_sizes(points, tets, labels, roi_points, config)
+    if config.method == "mmg":
+        print(f"  MMG3D remesh (hausd {config.mmg_hausd_mm} mm)...")
+        points, tets, labels = mmg_remesh(
+            points,
+            np.ascontiguousarray(tets, dtype=np.int32),
+            np.ascontiguousarray(labels, dtype=np.int32),
+            config.mmg_hausd_mm,
+            config.mmg_hmax_mm,
+            config.mmg_hmin_mm,
+            config.mmg_hgrad,
+            1,
+            int(config.mmg_aniso),
+            int(config.mmg_angle_detect),
+            int(config.mmg_nofem),
+        )
+        print(f"  remeshed: {len(points):,} nodes, {len(tets):,} tets")
 
-    print("  decimating interface surfaces...")
-    d_points, d_tris, d_refs = decimate_interfaces(points, tets, labels, sizes)
-    print(f"  decimated complex: {len(d_points):,} nodes, {len(d_tris):,} triangles")
+    tris, refs = boundary_facets(points, tets, labels)
+    print(f"  exporting {len(tris):,} boundary triangles")
 
     jobs: list[tuple[int, str, list[Part]]] = []
+    failed: list[str] = []
     for tag, label in VOLUME_KEY_TO_LABEL.items():
-        solids = tissue_solids(d_points, d_tris, d_refs, tag, label)
-        if not solids:
+        # A tissue whose walls cannot be resolved into valid solids is a geometry
+        # problem to report, not a reason to lose the tissues that did resolve.
+        # Under `mmg` this list is expected to stay empty; an entry in it means the
+        # remesh produced something the solid decomposition could not accept.
+        try:
+            parts = tissue_solids(points, tris, refs, tag, label)
+        except RuntimeError as e:
+            print(f"  {label}: FAILED -- {e}")
+            failed.append(label)
             continue
-        parts = [(name, [shell_arrays(s) for s in shells]) for name, shells in solids]
-        n_faces = sum(len(tris) for _, arrs in parts for _, tris in arrs)
+        if not parts:
+            continue
+        n_faces = sum(len(tris) for _, shells in parts for _, tris in shells)
         print(f"  {label}: {len(parts)} part(s), {n_faces} faces")
         jobs.append((n_faces, str(out_dir / f"{label}.step"), parts))
+
+    if failed:
+        print(
+            f"  ! {len(failed)}/{len(VOLUME_KEY_TO_LABEL)} tissues failed to "
+            f"resolve into valid solids: {', '.join(failed)}"
+        )
 
     # Largest first: there are only ever a handful of tissues, and one of them
     # (gray matter) dwarfs the rest, so it sets the makespan -- start it before

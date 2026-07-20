@@ -4,3 +4,6 @@
 [submodule "external/opencascade"]
 	path = external/opencascade
 	url = https://github.com/Open-Cascade-SAS/OCCT
+[submodule "external/mmg"]
+	path = external/mmg
+	url = https://github.com/MmgTools/mmg

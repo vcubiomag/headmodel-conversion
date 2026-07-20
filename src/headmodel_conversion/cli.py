@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import cyclopts
 
 from . import SizingConfig, convert
-from .densities import ROIConfig
 
 app = cyclopts.App(help="Convert a CHARM m2m directory into Ansys-importable STEP files.")
 
@@ -17,31 +17,29 @@ def main(
     m2m_dir: Path,
     out_dir: Path,
     *,
-    roi: list[str] | None = None,
-    roi_radius_mm: float = ROIConfig.radius_mm,
-    roi_edge_mm: float = ROIConfig.edge_mm,
+    method: Literal["mmg", "charm"] = SizingConfig.method,
+    hausd_mm: float = SizingConfig.mmg_hausd_mm,
+    hmax_mm: float = SizingConfig.mmg_hmax_mm,
 ) -> None:
-    """Decimate one subject and export one STEP file per tissue.
+    """Convert one subject and export one STEP file per tissue.
 
     Parameters
     ----------
     m2m_dir
-        A CHARM `m2m_<sub>` directory containing `<sub>.msh` and `eeg_positions/`.
+        A CHARM `m2m_<sub>` directory containing `<sub>.msh`.
     out_dir
         Directory to write `<tissue>.step` files into.
-    roi
-        10-10 electrode labels marking TMS coil sites to hold near CHARM
-        resolution, one `--roi` per site (e.g. `--roi C3 --roi F3 --roi FCz`).
-        Omit to disable ROI refinement entirely.
-    roi_radius_mm
-        Distance (mm) from each ROI site over which resolution ramps back up to
-        the tissue's base edge length.
-    roi_edge_mm
-        Target edge length (mm) at the ROI sites themselves.
+    method
+        `mmg` (default) remeshes the whole tet volume with MMG3D -- conformal and
+        valid for every tissue, including the folded ones. `charm` exports CHARM's
+        own triangulation uncoarsened (~1.24M faces; too large for Ansys).
+    hausd_mm
+        MMG Hausdorff bound (mm): how far a boundary may move. The quality/size
+        knob -- larger coarsens more (smoothing sulci).
+    hmax_mm
+        MMG maximum edge length (mm).
     """
-    config = SizingConfig(
-        roi=ROIConfig(electrodes=tuple(roi or ()), radius_mm=roi_radius_mm, edge_mm=roi_edge_mm)
-    )
+    config = SizingConfig(method=method, mmg_hausd_mm=hausd_mm, mmg_hmax_mm=hmax_mm)
     written = convert(m2m_dir, out_dir, config)
     print(f"wrote {len(written)} tissue STEP files to {out_dir}")
 

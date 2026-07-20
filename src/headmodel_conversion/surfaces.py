@@ -1,17 +1,30 @@
-"""Assemble per-tissue, single-lump solids from the decimated interface complex.
+"""Assemble per-tissue, single-lump solids from the interface complex.
 
-The decimator returns a set of triangles (shared global vertices) each tagged
-with the material pair it separates (`ref = lo*1000 + hi`, outside = 0). A
-tissue's boundary is every triangle whose pair includes that tissue. Split that
-boundary into connected shells; a peripheral shell plus the shells nested inside
-it (its cavities -- e.g. the skull's marrow voids) is one solid. Genuinely
-separate pieces (the two eyeballs) become separate solids.
+`boundary_facets` returns a set of triangles (shared global vertices) each tagged
+with the material pair it separates (`ref = lo*1000 + hi`, outside = 0) and wound
+so its normal points out of `lo`. A tissue's boundary is every triangle whose
+pair includes that tissue, reversed wherever the tissue is `hi` -- which leaves a
+soup wound consistently out of the tissue.
+
+`repair_solids` then splits that soup where it is non-manifold and decomposes it
+into volumes: a peripheral shell plus the shells nested inside it (its cavities
+-- e.g. the skull's marrow voids) is one solid, and genuinely separate pieces
+(the two eyeballs) become separate solids. Ansys Maxwell disallows overlapping
+dielectrics, so that cavity nesting is what the whole export rests on; it is
+decided by exact predicates rather than by sampling points.
+
+Nothing here deletes a face. A soup that arrives non-manifold -- two walls of a
+tissue driven into contact -- is reported by `repair_solids` rather than patched
+over: geometry that thin is a segmentation or remeshing problem to look at, not a
+face to quietly drop.
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pyvista
+
+from .mesher import heal_soup, repair_solids
+from .sheets import split_sheets
 
 # gmsh physical tag -> tissue label. Matches the CHARM head model.
 VOLUME_KEY_TO_LABEL = {
@@ -26,72 +39,32 @@ VOLUME_KEY_TO_LABEL = {
     10: "muscle",
 }
 
-# Drop connected shells smaller than this many faces (decimation specks).
+# Drop shells smaller than this many faces (remeshing specks).
 MIN_SHELL_FACES = 12
 
-
-def _polydata(points: np.ndarray, faces: np.ndarray) -> pyvista.PolyData:
-    conn = np.hstack(
-        [np.full((len(faces), 1), 3, dtype=np.int64), faces.astype(np.int64)]
-    ).ravel()
-    return pyvista.PolyData(np.ascontiguousarray(points, dtype=np.float64), conn)
+Shell = tuple[np.ndarray, np.ndarray]
 
 
-def tissue_surface(
-    points: np.ndarray, faces: np.ndarray, refs: np.ndarray, tag: int
-) -> pyvista.PolyData:
-    """The full boundary surface of one tissue, cleaned of unused vertices."""
+def tissue_soup(points: np.ndarray, faces: np.ndarray, refs: np.ndarray, tag: int) -> Shell:
+    """One tissue's whole boundary, wound outward, over its own vertices."""
     lo, hi = refs // 1000, refs % 1000
-    mask = (lo == tag) | (hi == tag)
-    surface = _polydata(points, faces[mask]).clean().triangulate()
-    if surface.n_open_edges > 0:
-        surface = surface.fill_holes(hole_size=1e6).clean().triangulate()
-    return surface
+    mine = (lo == tag) | (hi == tag)
+    tris = faces[mine]
+    # Facets carry the winding out of `lo`; reverse the ones this tissue bounds
+    # from the `hi` side so every normal ends up pointing out of *this* tissue.
+    flip = hi[mine] == tag
+    tris[flip] = tris[flip][:, [0, 2, 1]]
+
+    used = np.unique(tris)
+    remap = np.full(len(points), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return (
+        np.ascontiguousarray(points[used], dtype=np.float64),
+        np.ascontiguousarray(remap[tris], dtype=np.int32),
+    )
 
 
-def split_shells(surface: pyvista.PolyData) -> list[pyvista.PolyData]:
-    """Split a surface into its connected closed shells, largest volume first."""
-    labeled = surface.connectivity("all")
-    region_ids = np.asarray(labeled.cell_data["RegionId"])
-    shells = [
-        labeled.extract_cells(region_ids == r).extract_surface(algorithm="dataset_surface")
-        for r in np.unique(region_ids)
-    ]
-    shells = [s for s in shells if s.n_cells >= MIN_SHELL_FACES]
-    shells.sort(key=lambda s: s.volume, reverse=True)
-    return shells
-
-
-def group_shells(shells: list[pyvista.PolyData]) -> list[list[pyvista.PolyData]]:
-    """Group shells into solids. Each group is [outer, void, void, ...]: an
-    outermost shell followed by the shells nested inside it (its cavities).
-    Non-nested shells start their own group.
-    """
-    remaining = list(shells)  # largest first
-    groups: list[list[pyvista.PolyData]] = []
-
-    while remaining:
-        outer = remaining.pop(0)
-        voids: list[pyvista.PolyData] = []
-        still: list[pyvista.PolyData] = []
-
-        if remaining:
-            offsets = np.cumsum([0] + [s.n_points for s in remaining])
-            cloud = pyvista.PolyData(np.vstack([s.points for s in remaining]))
-            inside = np.asarray(
-                cloud.select_interior_points(outer, check_surface=False)["selected_points"]
-            )
-            for i, shell in enumerate(remaining):
-                fraction = inside[offsets[i] : offsets[i + 1]].mean()
-                (voids if fraction > 0.5 else still).append(shell)
-
-        groups.append([outer, *voids])
-        remaining = still
-
-    return groups
-
-
-def solid_names(label: str, groups: list[list[pyvista.PolyData]]) -> list[str]:
+def solid_names(label: str, groups: list[list[Shell]]) -> list[str]:
     """Name per solid: single -> `<label>`, multiple -> `<label>_N`.
 
     These name the products inside the tissue's STEP file, which is what tells
@@ -103,31 +76,49 @@ def solid_names(label: str, groups: list[list[pyvista.PolyData]]) -> list[str]:
         return [label]
 
     if label == "eye_balls" and len(groups) == 2:
-        centroids_x = [float(np.asarray(g[0].points)[:, 0].mean()) for g in groups]
+        centroids_x = [float(g[0][0][:, 0].mean()) for g in groups]
         order = "LR" if centroids_x[0] < centroids_x[1] else "RL"
         return [f"eye_ball_{side}" for side in order]
 
     return [f"{label}_{i + 1}" for i in range(len(groups))]
 
 
+def _repair(pts: np.ndarray, tris: np.ndarray) -> list[list[Shell]]:
+    """Decompose the soup into solids, healing it first only if it will not decompose.
+
+    Both supported methods should reach `repair_solids` with a closed manifold soup:
+    CHARM's own triangulation is one already, and MMG3D remeshes a tissue's two walls
+    together so it cannot drive them through each other. `heal_soup` fills tears and
+    removes self-intersections, and is kept as insurance against input that violates
+    that expectation -- it is expensive, so it runs only once the direct path has
+    failed. A tissue reaching it is worth investigating, not ignoring.
+    """
+    try:
+        return repair_solids(pts, tris)
+    except RuntimeError:
+        hp, hf, _ = heal_soup(pts, tris)
+        return repair_solids(np.ascontiguousarray(hp), np.ascontiguousarray(hf))
+
+
 def tissue_solids(
     points: np.ndarray, faces: np.ndarray, refs: np.ndarray, tag: int, label: str
-) -> list[tuple[str, list[pyvista.PolyData]]]:
-    """All single-lump solids for one tissue, as (name, [outer, *voids])."""
-    surface = tissue_surface(points, faces, refs, tag)
-    if surface.n_cells == 0:
+) -> list[tuple[str, list[Shell]]]:
+    """All single-lump solids for one tissue, as (name, [outer, *cavities])."""
+    pts, tris = tissue_soup(points, faces, refs, tag)
+    if len(tris) == 0:
         return []
-    groups = group_shells(split_shells(surface))
+
+    # Resolve the tissue's self-contact before handing it to CGAL, which would
+    # otherwise tear it open rather than split it. See `sheets`.
+    pts, tris, _ = split_sheets(pts, tris)
+
+    groups: list[list[Shell]] = []
+    for outer, *voids in _repair(pts, tris):
+        if len(outer[1]) < MIN_SHELL_FACES:
+            continue  # a speck, and with it any cavity it claimed to hold
+        groups.append([outer, *(v for v in voids if len(v[1]) >= MIN_SHELL_FACES)])
+
     if not groups:
         return []
-    groups.sort(key=lambda g: g[0].n_cells, reverse=True)
+    groups.sort(key=lambda g: len(g[0][1]), reverse=True)
     return list(zip(solid_names(label, groups), groups))
-
-
-def shell_arrays(shell: pyvista.PolyData) -> tuple[np.ndarray, np.ndarray]:
-    """(points (N,3) float64, triangles (M,3) int32) for one closed shell."""
-    tri = shell.triangulate().clean()
-    points = np.ascontiguousarray(tri.points, dtype=np.float64)
-    faces = np.asarray(tri.faces).reshape(-1, 4)
-    triangles = np.ascontiguousarray(faces[:, 1:], dtype=np.int32)
-    return points, triangles

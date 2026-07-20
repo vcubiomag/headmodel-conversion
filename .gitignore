@@ -15,3 +15,5 @@ compile_commands.json
 .ruff_cache
 
 data
+ansys_bodies*
+run_all_subjects.py

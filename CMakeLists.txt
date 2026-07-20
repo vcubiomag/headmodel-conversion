@@ -57,6 +57,24 @@ file(COPY
 # in the submodule, so it survives a fresh `submodule update`.
 set_target_properties(TKDESTEP PROPERTIES LINK_LIBRARIES "" INTERFACE_LINK_LIBRARIES "")
 
+# MMG: robust conformal multi-material tetrahedral remeshing (libmmg3d_a static only). It coarsens
+# the CHARM tet mesh preserving every material interface and is non-self-intersecting by
+# construction, which per-patch surface decimation cannot guarantee for the folded tissues. Only the
+# 3D static library is built -- no CLI apps (EXCLUDE_FROM_ALL, nothing depends on the executable), no
+# MMG2D/MMGS, no optional backends. Options are forced before add_subdirectory so MMG's option()
+# calls see them; libmmg3d_a propagates its own include dir to whatever links it.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_MMG3D ON CACHE BOOL "" FORCE)
+set(BUILD_MMG2D OFF CACHE BOOL "" FORCE)
+set(BUILD_MMGS OFF CACHE BOOL "" FORCE)
+set(BUILD_MMG OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(USE_SCOTCH OFF CACHE BOOL "" FORCE)
+set(USE_ELAS OFF CACHE BOOL "" FORCE)
+set(USE_VTK OFF CACHE BOOL "" FORCE)
+set(USE_POINTMAP OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/mmg EXCLUDE_FROM_ALL)
+
 # Ordered dependents-first for single-pass (ELF) linkers.
 set(OCCT_LINK
   TKDESTEP TKXSBase TKShHealing TKTopAlgo TKGeomAlgo TKBRep TKGeomBase
@@ -83,7 +101,7 @@ if(UNIX AND NOT APPLE)
   set(OCCT_LINK_FILES -Wl,--start-group ${OCCT_LINK_FILES} -Wl,--end-group)
 endif()
 
-target_link_libraries(_mesher_ext PRIVATE CGAL::CGAL ${OCCT_LINK_FILES})
+target_link_libraries(_mesher_ext PRIVATE CGAL::CGAL libmmg3d_a ${OCCT_LINK_FILES})
 
 # System libs TKernel needs, not inherited through archive-file linking.
 if(APPLE)
